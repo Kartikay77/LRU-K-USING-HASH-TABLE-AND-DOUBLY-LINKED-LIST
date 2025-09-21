@@ -1,13 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 /* ---------------- Types ---------------- */
 
 typedef struct Node {
     struct Node *prev, *next;
     unsigned pageNumber;
-    unsigned refcnt;      // number of references seen
+    unsigned refcnt;     // references seen (capped at K)
+    int slot;            // physical frame index (for printing)
 } Node;
 
 typedef struct List {
@@ -22,17 +22,20 @@ typedef struct Hash {
 } Hash;
 
 typedef struct Cache {
-    unsigned frames;   // total frames allowed
-    unsigned used;     // nodes currently resident
+    unsigned frames;   // total frames
+    unsigned used;     // current resident
     unsigned K;        // LRU-K threshold
-    unsigned faults;   // page faults count
+    unsigned faults;   // page faults
     List cold;         // < K refs
     List hot;          // >= K refs
-    Hash *hash;        // page -> node
+    Hash *hash;
+
+    /* For per-step output in fixed columns */
+    int *frame;        // length = frames, stores page or -1
+    unsigned next_free_slot; // next free slot index while filling
 } Cache;
 
 /* --------------- List helpers --------------- */
-
 static void list_init(List *l) { l->front = l->rear = NULL; l->size = 0; }
 
 static void list_unlink(List *l, Node *n) {
@@ -62,78 +65,84 @@ static Node* list_pop_rear(List *l) {
 }
 
 /* --------------- Hash helpers --------------- */
-
 static Hash* hash_create(unsigned capacity) {
     Hash *h = (Hash*)malloc(sizeof(Hash));
+    if (!h) { perror("malloc"); exit(1); }
     h->capacity = capacity;
     h->array = (Node**)calloc(capacity, sizeof(Node*));
+    if (!h->array) { perror("calloc"); exit(1); }
     return h;
 }
-
 static inline Node* hash_get(Hash *h, unsigned page) {
     if (page >= h->capacity) return NULL;
     return h->array[page];
 }
-
 static inline void hash_put(Hash *h, unsigned page, Node *n) {
     if (page < h->capacity) h->array[page] = n;
 }
-
 static inline void hash_del(Hash *h, unsigned page) {
     if (page < h->capacity) h->array[page] = NULL;
 }
 
 /* --------------- Cache helpers --------------- */
-
 static Node* node_new(unsigned page) {
     Node *n = (Node*)malloc(sizeof(Node));
+    if (!n) { perror("malloc"); exit(1); }
     n->prev = n->next = NULL;
     n->pageNumber = page;
     n->refcnt = 0;
+    n->slot = -1;
     return n;
 }
 
 static Cache* cache_create(unsigned frames, unsigned K, unsigned maxPageIdInclusive) {
     Cache *c = (Cache*)malloc(sizeof(Cache));
+    if (!c) { perror("malloc"); exit(1); }
     c->frames = frames;
     c->used = 0;
-    c->K = (K == 0 ? 1 : K); // guard
+    c->K = (K == 0 ? 1 : K);
     c->faults = 0;
     list_init(&c->cold);
     list_init(&c->hot);
     c->hash = hash_create(maxPageIdInclusive + 1);
+    c->frame = (int*)malloc(sizeof(int) * frames);
+    if (!c->frame) { perror("malloc"); exit(1); }
+    for (unsigned i = 0; i < frames; ++i) c->frame[i] = -1;
+    c->next_free_slot = 0;
     return c;
 }
 
 static void cache_destroy(Cache *c) {
-    Node *cur;
-    cur = c->cold.front;
+    Node *cur = c->cold.front;
     while (cur) { Node *nxt = cur->next; free(cur); cur = nxt; }
     cur = c->hot.front;
     while (cur) { Node *nxt = cur->next; free(cur); cur = nxt; }
     free(c->hash->array);
     free(c->hash);
+    free(c->frame);
     free(c);
 }
 
 static int cache_full(Cache *c) { return c->used >= c->frames; }
 
-/* Evict policy: prefer cold.rear; otherwise hot.rear */
-static void cache_evict_one(Cache *c) {
+/* Evict policy: prefer cold.rear; otherwise hot.rear.
+   Returns evicted slot index or -1 if nothing evicted. */
+static int cache_evict_one(Cache *c) {
     Node *victim = NULL;
-    if (c->cold.size) {
-        victim = list_pop_rear(&c->cold);
-    } else if (c->hot.size) {
-        victim = list_pop_rear(&c->hot);
-    }
-    if (victim) {
-        hash_del(c->hash, victim->pageNumber);
-        free(victim);
-        c->used--;
-    }
+    if (c->cold.size)      victim = list_pop_rear(&c->cold);
+    else if (c->hot.size)  victim = list_pop_rear(&c->hot);
+
+    if (!victim) return -1;
+
+    int vslot = victim->slot;
+    hash_del(c->hash, victim->pageNumber);
+    c->frame[vslot] = -1;        // clear the physical frame
+    free(victim);
+    // 'used' is adjusted by caller (we typically insert right after)
+    return vslot;
 }
 
-/* Move node based on refcnt */
+/* Move node between lists based on refcnt and recency */
 static void promote_on_hit(Cache *c, Node *n) {
     if (n->refcnt >= c->K) {
         list_unlink(&c->cold, n);
@@ -145,10 +154,20 @@ static void promote_on_hit(Cache *c, Node *n) {
     }
 }
 
-/* Reference a page */
-static void cache_reference(Cache *c, unsigned page) {
+/* Print one line: the frames left->right */
+static void print_frames_line(Cache *c) {
+    for (unsigned i = 0; i < c->frames; ++i) {
+        printf("%d", c->frame[i]);
+        if (i + 1 < c->frames) printf("\t");
+    }
+    printf("\n");
+}
+
+/* Reference a page, print state after */
+static void cache_reference_and_print(Cache *c, unsigned page) {
     if (page >= c->hash->capacity) {
-        fprintf(stderr, "Invalid page %u (capacity %u)\n", page, c->hash->capacity);
+        fprintf(stderr, "Skip invalid page %u (capacity %u)\n", page, c->hash->capacity);
+        print_frames_line(c);
         return;
     }
 
@@ -157,25 +176,39 @@ static void cache_reference(Cache *c, unsigned page) {
     if (!n) {
         // MISS
         c->faults++;
-        if (cache_full(c)) cache_evict_one(c);
+
+        int slot;
+        if (cache_full(c)) {
+            slot = cache_evict_one(c);
+            // 'used' remains the same (evicted then inserted)
+        } else {
+            slot = (int)c->next_free_slot++;
+            c->used++;
+        }
 
         n = node_new(page);
         n->refcnt = 1;
+        n->slot = slot;
+
         hash_put(c->hash, page, n);
+        c->frame[slot] = (int)page;   // place in the physical slot
+
         list_push_front(&c->cold, n);
-        c->used++;
-        if (n->refcnt >= c->K) {
-            promote_on_hit(c, n);
-        }
+        if (n->refcnt >= c->K) promote_on_hit(c, n);
+
+        print_frames_line(c);
         return;
     }
 
     // HIT
     if (n->refcnt < c->K) n->refcnt++;
     promote_on_hit(c, n);
+
+    // On hit, physical slot doesn't change; just print
+    print_frames_line(c);
 }
 
-/* Debug print */
+/* Debug print of lists */
 static void print_list(const char *name, const List *l) {
     printf("%s (MRU -> LRU)[%u]: ", name, l->size);
     for (const Node *cur = l->front; cur; cur = cur->next) {
@@ -183,7 +216,6 @@ static void print_list(const char *name, const List *l) {
     }
     printf("\n");
 }
-
 static void cache_print(Cache *c) {
     print_list("HOT >=K", &c->hot);
     print_list("COLD <K", &c->cold);
@@ -191,38 +223,36 @@ static void cache_print(Cache *c) {
 }
 
 /* ---------------- Main ---------------- */
-
 int main(void) {
     unsigned frames, K, n;
 
     printf("Enter number of frames: ");
-    scanf("%u", &frames);
+    if (scanf("%u", &frames) != 1) return 0;
 
     printf("Enter K (for LRU-K): ");
-    scanf("%u", &K);
+    if (scanf("%u", &K) != 1) return 0;
 
     printf("Enter number of page references: ");
-    scanf("%u", &n);
+    if (scanf("%u", &n) != 1) return 0;
 
     unsigned *seq = (unsigned*)malloc(n * sizeof(unsigned));
     if (!seq) { perror("malloc"); return 1; }
 
-    printf("Enter %u page numbers: ", n);
+    printf("Enter reference string: ");
+    unsigned maxPage = 0;
     for (unsigned i = 0; i < n; i++) {
         scanf("%u", &seq[i]);
-    }
-
-    // compute max page id for hash capacity
-    unsigned maxPage = 0;
-    for (unsigned i = 0; i < n; ++i)
         if (seq[i] > maxPage) maxPage = seq[i];
+    }
 
     Cache *cache = cache_create(frames, K, maxPage);
 
     for (unsigned i = 0; i < n; ++i) {
-        cache_reference(cache, seq[i]);
+        cache_reference_and_print(cache, seq[i]);
     }
 
+    /* Final summaries */
+    printf("\nTotal Page Faults = %u\n", cache->faults);
     printf("\nLRU-%u using hashtable and doubly linked lists\n", K);
     cache_print(cache);
 
